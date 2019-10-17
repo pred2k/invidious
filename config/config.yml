@@ -7,5 +7,26 @@ db:
   port: 5432
   dbname: invidious
 full_refresh: false
-https_only: false
+https_only: true
 domain:
+
+# disable user registration. keep no user-data!
+registration_enabled: false
+login_enabled: false
+
+# disable most watched videos on this instance:
+top_enabled: false
+# remove stupid trending or popluar videos:
+feed_menu: []
+
+banner: instance with minimal distraction and maximum privacy for viewers
+
+default_user_preferences:
+  # enable proxy mode:
+  local: true
+  # offer best quality as default:
+  quality: dash
+  # remove any "toxic" video suggestion:
+  related_videos: false
+  # completely disable (hate) comments (can't be re-enabled by users atm):
+  comments: []
