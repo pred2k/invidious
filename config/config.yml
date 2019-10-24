@@ -29,4 +29,4 @@ default_user_preferences:
   # remove any "toxic" video suggestion:
   related_videos: false
   # completely disable (hate) comments (can't be re-enabled by users atm):
-  comments: []
+  comments: ["",""]
