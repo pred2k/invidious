@@ -24,6 +24,7 @@ require "sqlite3"
 require "xml"
 require "yaml"
 require "zip"
+require "protodec/utils"
 require "./invidious/helpers/*"
 require "./invidious/*"
 
@@ -46,6 +47,7 @@ PUBSUB_URL      = URI.parse("https://pubsubhubbub.appspot.com")
 REDDIT_URL      = URI.parse("https://www.reddit.com")
 TEXTCAPTCHA_URL = URI.parse("http://textcaptcha.com")
 YT_URL          = URI.parse("https://www.youtube.com")
+YT_IMG_URL      = URI.parse("https://i.ytimg.com")
 
 CHARS_SAFE         = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 TEST_IDS           = {"AgbeGFYluEA", "BaW_jenozKc", "a9LDPn-MO4I", "ddFvjfvPnqk", "iqKdEhx-dD4"}
@@ -81,6 +83,7 @@ LOCALES = {
   "fr"    => load_locale("fr"),
   "is"    => load_locale("is"),
   "it"    => load_locale("it"),
+  "ja"    => load_locale("ja"),
   "nb_NO" => load_locale("nb_NO"),
   "nl"    => load_locale("nl"),
   "pl"    => load_locale("pl"),
@@ -90,6 +93,9 @@ LOCALES = {
   "zh-CN" => load_locale("zh-CN"),
   "zh-TW" => load_locale("zh-TW"),
 }
+
+YT_POOL     = HTTPPool.new(YT_URL, capacity: CONFIG.pool_size, timeout: 0.05)
+YT_IMG_POOL = HTTPPool.new(YT_IMG_URL, capacity: CONFIG.pool_size, timeout: 0.05)
 
 config = CONFIG
 logger = Invidious::LogHandler.new
@@ -293,10 +299,8 @@ before_all do |env|
   end
 
   dark_mode = convert_theme(env.params.query["dark_mode"]?) || preferences.dark_mode.to_s
-
   thin_mode = env.params.query["thin_mode"]? || preferences.thin_mode.to_s
   thin_mode = thin_mode == "true"
-
   locale = env.params.query["hl"]? || preferences.locale
 
   preferences.dark_mode = dark_mode
@@ -319,26 +323,32 @@ before_all do |env|
 end
 
 get "/" do |env|
-  locale = LOCALES[env.get("preferences").as(Preferences).locale]?
+  preferences = env.get("preferences").as(Preferences)
+  locale = LOCALES[preferences.locale]?
   user = env.get? "user"
 
-  if user
-    user = user.as(User)
-    if user.preferences.redirect_feed
-      next env.redirect "/feed/subscriptions"
-    end
-  end
-
-  case config.default_home
+  case preferences.default_home
+  when ""
+    templated "empty"
   when "Popular"
     templated "popular"
   when "Top"
-    templated "top"
+    if config.top_enabled
+      templated "top"
+    else
+      templated "empty"
+    end
   when "Trending"
     env.redirect "/feed/trending"
   when "Subscriptions"
     if user
       env.redirect "/feed/subscriptions"
+    else
+      templated "popular"
+    end
+  when "Playlists"
+    if user
+      env.redirect "/view_all_playlists"
     else
       templated "popular"
     end
@@ -489,7 +499,7 @@ get "/watch" do |env|
 
   # Older videos may not have audio sources available.
   # We redirect here so they're not unplayable
-  if audio_streams.empty?
+  if audio_streams.empty? && !video.live_now
     if params.quality == "dash"
       env.params.query.delete_all("quality")
       env.params.query["quality"] = "medium"
@@ -654,8 +664,7 @@ get "/embed/:id" do |env|
 
     next env.redirect url
   when "live_stream"
-    client = make_client(YT_URL)
-    response = client.get("/embed/live_stream?channel=#{env.params.query["channel"]? || ""}")
+    response = YT_POOL.client &.get("/embed/live_stream?channel=#{env.params.query["channel"]? || ""}")
     video_id = response.body.match(/"video_id":"(?<video_id>[a-zA-Z0-9_-]{11})"/).try &.["video_id"]
 
     env.params.query.delete_all("channel")
@@ -729,14 +738,14 @@ get "/embed/:id" do |env|
   video_streams = video.video_streams(adaptive_fmts)
   audio_streams = video.audio_streams(adaptive_fmts)
 
-  if audio_streams.empty?
+  if audio_streams.empty? && !video.live_now
     if params.quality == "dash"
       env.params.query.delete_all("quality")
-      next env.redirect "/embed/#{video_id}?#{env.params.query}"
+      next env.redirect "/embed/#{id}?#{env.params.query}"
     elsif params.listen
       env.params.query.delete_all("listen")
       env.params.query["listen"] = "0"
-      next env.redirect "/embed/#{video_id}?#{env.params.query}"
+      next env.redirect "/embed/#{id}?#{env.params.query}"
     end
   end
 
@@ -782,6 +791,10 @@ get "/embed/:id" do |env|
 end
 
 # Playlists
+
+get "/feed/playlists" do |env|
+  env.redirect "/view_all_playlists"
+end
 
 get "/view_all_playlists" do |env|
   locale = LOCALES[env.get("preferences").as(Preferences).locale]?
@@ -1379,8 +1392,7 @@ get "/login" do |env|
   captcha_type ||= "image"
 
   tfa = env.params.query["tfa"]?
-  tfa ||= false
-  prompt = ""
+  prompt = nil
 
   templated "login"
 end
@@ -1433,7 +1445,7 @@ post "/login" do |env|
 
       headers["Content-Type"] = "application/x-www-form-urlencoded;charset=utf-8"
       headers["Google-Accounts-XSRF"] = "1"
-      headers["User-Agent"] = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.75 Safari/537.36"
+      headers["User-Agent"] = random_user_agent
 
       response = client.post("/_/signin/sl/lookup", headers, login_req(lookup_req))
       lookup_results = JSON.parse(response.body[5..-1])
@@ -1442,10 +1454,17 @@ post "/login" do |env|
 
       user_hash = lookup_results[0][2]
 
+      if token = env.params.body["token"]?
+        answer = env.params.body["answer"]?
+        captcha = {token, answer}
+      else
+        captcha = nil
+      end
+
       challenge_req = {
         user_hash, nil, 1, nil,
         {1, nil, nil, nil,
-         {password, nil, true},
+         {password, captcha, true},
         },
         {nil, nil,
          {2, 1, nil, 1,
@@ -1473,11 +1492,14 @@ post "/login" do |env|
         next templated "error"
       end
 
-      # TODO: Handle Google's CAPTCHA
-      if captcha = challenge_results[0][-1]?.try &.[-1]?.try &.as_h?.try &.["5001"]?.try &.[-1].as_a?
-        error_message = "Unhandled CAPTCHA. Please try again later."
-        env.response.status_code = 401
-        next templated "error"
+      if token = challenge_results[0][-1]?.try &.[-1]?.try &.as_h?.try &.["5001"]?.try &.[-1].as_a?.try &.[-1].as_s
+        account_type = "google"
+        captcha_type = "image"
+        prompt = nil
+        tfa = tfa_code
+        captcha = {tokens: [token], question: ""}
+
+        next templated "login"
       end
 
       if challenge_results[0][-1]?.try &.[5] == "INCORRECT_ANSWER_ENTERED"
@@ -1536,7 +1558,7 @@ post "/login" do |env|
             prompt = "Google verification code"
           end
 
-          tfa = true
+          tfa = nil
           captcha = nil
           next templated "login"
         end
@@ -1952,9 +1974,15 @@ post "/preferences" do |env|
   related_videos ||= "off"
   related_videos = related_videos == "on"
 
-  redirect_feed = env.params.body["redirect_feed"]?.try &.as(String)
-  redirect_feed ||= "off"
-  redirect_feed = redirect_feed == "on"
+  default_home = env.params.body["default_home"]?.try &.as(String) || CONFIG.default_user_preferences.default_home
+
+  feed_menu = [] of String
+  5.times do |index|
+    option = env.params.body["feed_menu[#{index}]"]?.try &.as(String) || ""
+    if !option.empty?
+      feed_menu << option
+    end
+  end
 
   locale = env.params.body["locale"]?.try &.as(String)
   locale ||= CONFIG.default_user_preferences.locale
@@ -2002,7 +2030,8 @@ post "/preferences" do |env|
     notifications_only:     notifications_only,
     player_style:           player_style,
     quality:                quality,
-    redirect_feed:          redirect_feed,
+    default_home:           default_home,
+    feed_menu:              feed_menu,
     related_videos:         related_videos,
     sort:                   sort,
     speed:                  speed,
@@ -2017,16 +2046,16 @@ post "/preferences" do |env|
     PG_DB.exec("UPDATE users SET preferences = $1 WHERE email = $2", preferences, user.email)
 
     if config.admins.includes? user.email
-      config.default_home = env.params.body["default_home"]?.try &.as(String) || config.default_home
+      config.default_user_preferences.default_home = env.params.body["admin_default_home"]?.try &.as(String) || config.default_user_preferences.default_home
 
-      feed_menu = [] of String
-      4.times do |index|
-        option = env.params.body["feed_menu[#{index}]"]?.try &.as(String) || ""
+      admin_feed_menu = [] of String
+      5.times do |index|
+        option = env.params.body["admin_feed_menu[#{index}]"]?.try &.as(String) || ""
         if !option.empty?
-          feed_menu << option
+          admin_feed_menu << option
         end
       end
-      config.feed_menu = feed_menu
+      config.default_user_preferences.feed_menu = admin_feed_menu
 
       top_enabled = env.params.body["top_enabled"]?.try &.as(String)
       top_enabled ||= "off"
@@ -2048,6 +2077,7 @@ post "/preferences" do |env|
       statistics_enabled ||= "off"
       config.statistics_enabled = statistics_enabled == "on"
 
+      CONFIG.default_user_preferences = config.default_user_preferences
       File.write("config/config.yml", config.to_yaml)
     end
   else
@@ -2234,8 +2264,7 @@ get "/modify_notifications" do |env|
     headers = HTTP::Headers.new
     headers["Cookie"] = env.request.headers["Cookie"]
 
-    client = make_client(YT_URL)
-    html = client.get("/subscription_manager?disable_polymer=1", headers)
+    html = YT_POOL.client &.get("/subscription_manager?disable_polymer=1", headers)
 
     cookies = HTTP::Cookies.from_headers(headers)
     html.cookies.each do |cookie|
@@ -2264,7 +2293,7 @@ get "/modify_notifications" do |env|
       channel_id = channel.content.lstrip("/channel/").not_nil!
       channel_req["channel_id"] = channel_id
 
-      client.post("/subscription_ajax?action_update_subscription_preferences=1", headers, form: channel_req)
+      YT_POOL.client &.post("/subscription_ajax?action_update_subscription_preferences=1", headers, form: channel_req)
     end
   end
 
@@ -2542,8 +2571,7 @@ post "/data_control" do |env|
           if match = channel["url"].as_s.match(/\/channel\/(?<channel>UC[a-zA-Z0-9_-]{22})/)
             next match["channel"]
           elsif match = channel["url"].as_s.match(/\/user\/(?<user>.+)/)
-            client = make_client(YT_URL)
-            response = client.get("/user/#{match["user"]}?disable_polymer=1&hl=en&gl=US")
+            response = YT_POOL.client &.get("/user/#{match["user"]}?disable_polymer=1&hl=en&gl=US")
             document = XML.parse_html(response.body)
             canonical = document.xpath_node(%q(//link[@rel="canonical"]))
 
@@ -3068,8 +3096,7 @@ get "/feed/channel/:ucid" do |env|
     next error_message
   end
 
-  client = make_client(YT_URL)
-  rss = client.get("/feeds/videos.xml?channel_id=#{channel.ucid}").body
+  rss = YT_POOL.client &.get("/feeds/videos.xml?channel_id=#{channel.ucid}").body
   rss = XML.parse_html(rss)
 
   videos = [] of SearchVideo
@@ -3213,8 +3240,7 @@ get "/feed/playlist/:plid" do |env|
     end
   end
 
-  client = make_client(YT_URL)
-  response = client.get("/feeds/videos.xml?playlist_id=#{plid}")
+  response = YT_POOL.client &.get("/feeds/videos.xml?playlist_id=#{plid}")
   document = XML.parse(response.body)
 
   document.xpath_nodes(%q(//*[@href]|//*[@url])).each do |node|
@@ -3379,14 +3405,13 @@ end
 {"/channel/:ucid/live", "/user/:user/live", "/c/:user/live"}.each do |route|
   get route do |env|
     locale = LOCALES[env.get("preferences").as(Preferences).locale]?
-    client = make_client(YT_URL)
 
     # Appears to be a bug in routing, having several routes configured
     # as `/a/:a`, `/b/:a`, `/c/:a` results in 404
     value = env.request.resource.split("/")[2]
     body = ""
     {"channel", "user", "c"}.each do |type|
-      response = client.get("/#{type}/#{value}/live?disable_polymer=1")
+      response = YT_POOL.client &.get("/#{type}/#{value}/live?disable_polymer=1")
       if response.status_code == 200
         body = response.body
       end
@@ -3417,10 +3442,9 @@ end
 get "/c/:user" do |env|
   locale = LOCALES[env.get("preferences").as(Preferences).locale]?
 
-  client = make_client(YT_URL)
   user = env.params.url["user"]
 
-  response = client.get("/c/#{user}")
+  response = YT_POOL.client &.get("/c/#{user}")
   document = XML.parse_html(response.body)
 
   anchor = document.xpath_node(%q(//a[contains(@class,"branded-page-header-title-link")]))
@@ -3660,7 +3684,6 @@ get "/api/v1/storyboards/:id" do |env|
   id = env.params.url["id"]
   region = env.params.query["region"]?
 
-  client = make_client(YT_URL)
   begin
     video = get_video(id, PG_DB, region: region)
   rescue ex : VideoRedirect
@@ -3748,7 +3771,6 @@ get "/api/v1/captions/:id" do |env|
   # In future this should be investigated as an alternative, since it does not require
   # getting video info.
 
-  client = make_client(YT_URL)
   begin
     video = get_video(id, PG_DB, region: region)
   rescue ex : VideoRedirect
@@ -3807,7 +3829,7 @@ get "/api/v1/captions/:id" do |env|
   # Auto-generated captions often have cues that aren't aligned properly with the video,
   # as well as some other markup that makes it cumbersome, so we try to fix that here
   if caption.name.simpleText.includes? "auto-generated"
-    caption_xml = client.get(url).body
+    caption_xml = YT_POOL.client &.get(url).body
     caption_xml = XML.parse(caption_xml)
 
     webvtt = String.build do |str|
@@ -3850,7 +3872,7 @@ get "/api/v1/captions/:id" do |env|
       end
     end
   else
-    webvtt = client.get("#{url}&format=vtt").body
+    webvtt = YT_POOL.client &.get("#{url}&format=vtt").body
   end
 
   if title = env.params.query["title"]?
@@ -3936,81 +3958,9 @@ get "/api/v1/insights/:id" do |env|
   id = env.params.url["id"]
   env.response.content_type = "application/json"
 
-  error_message = {"error" => "YouTube has removed publicly-available analytics."}.to_json
+  error_message = {"error" => "YouTube has removed publicly available analytics."}.to_json
   env.response.status_code = 410
-  next error_message
-
-  client = make_client(YT_URL)
-  headers = HTTP::Headers.new
-  response = client.get("/watch?v=#{id}&gl=US&hl=en&disable_polymer=1")
-
-  headers["cookie"] = response.cookies.add_request_headers(headers)["cookie"]
-  headers["content-type"] = "application/x-www-form-urlencoded"
-
-  headers["x-client-data"] = "CIi2yQEIpbbJAQipncoBCNedygEIqKPKAQ=="
-  headers["x-spf-previous"] = "https://www.youtube.com/watch?v=#{id}"
-  headers["x-spf-referer"] = "https://www.youtube.com/watch?v=#{id}"
-
-  headers["x-youtube-client-name"] = "1"
-  headers["x-youtube-client-version"] = "2.20180719"
-
-  session_token = response.body.match(/'XSRF_TOKEN': "(?<session_token>[A-Za-z0-9\_\-\=]+)"/).try &.["session_token"]? || ""
-  post_req = {
-    session_token: session_token,
-  }
-
-  response = client.post("/insight_ajax?action_get_statistics_and_data=1&v=#{id}", headers, form: post_req).body
-  response = XML.parse(response)
-
-  html_content = XML.parse_html(response.xpath_node(%q(//html_content)).not_nil!.content)
-  graph_data = response.xpath_node(%q(//graph_data))
-  if !graph_data
-    error = html_content.xpath_node(%q(//p)).not_nil!.content
-    next {"error" => error}.to_json
-  end
-
-  graph_data = JSON.parse(graph_data.content)
-
-  view_count = 0_i64
-  time_watched = 0_i64
-  subscriptions_driven = 0
-  shares = 0
-
-  stats_nodes = html_content.xpath_nodes(%q(//table/tr/td))
-  stats_nodes.each do |node|
-    key = node.xpath_node(%q(.//span))
-    value = node.xpath_node(%q(.//div))
-
-    if !key || !value
-      next
-    end
-
-    key = key.content
-    value = value.content
-
-    case key
-    when "Views"
-      view_count = value.delete(", ").to_i64
-    when "Time watched"
-      time_watched = value
-    when "Subscriptions driven"
-      subscriptions_driven = value.delete(", ").to_i
-    when "Shares"
-      shares = value.delete(", ").to_i
-    end
-  end
-
-  avg_view_duration_seconds = html_content.xpath_node(%q(//div[@id="stats-chart-tab-watch-time"]/span/span[2])).not_nil!.content
-  avg_view_duration_seconds = decode_length_seconds(avg_view_duration_seconds)
-
-  {
-    "viewCount"              => view_count,
-    "timeWatchedText"        => time_watched,
-    "subscriptionsDriven"    => subscriptions_driven,
-    "shares"                 => shares,
-    "avgViewDurationSeconds" => avg_view_duration_seconds,
-    "graphData"              => graph_data,
-  }.to_json
+  error_message
 end
 
 get "/api/v1/annotations/:id" do |env|
@@ -4069,9 +4019,7 @@ get "/api/v1/annotations/:id" do |env|
       cache_annotation(PG_DB, id, annotations)
     end
   when "youtube"
-    client = make_client(YT_URL)
-
-    response = client.get("/annotations_invideo?video_id=#{id}")
+    response = YT_POOL.client &.get("/annotations_invideo?video_id=#{id}")
 
     if response.status_code != 200
       env.response.status_code = response.status_code
@@ -4607,8 +4555,7 @@ end
     if format == "html"
       response = JSON.parse(response)
       playlist_html = template_playlist(response)
-      index = response["videos"].as_a[1]?.try &.["index"]
-      next_video = response["videos"].as_a[1]?.try &.["videoId"]
+      index, next_video = response["videos"].as_a.skip(1).select { |video| !video["author"].as_s.empty? }[0]?.try { |v| {v["index"], v["videoId"]} } || {nil, nil}
 
       response = {
         "playlistHtml" => playlist_html,
@@ -4641,7 +4588,6 @@ get "/api/v1/mixes/:rdid" do |env|
       mix = fetch_mix(rdid, mix.videos[1].id)
       index = mix.videos.index(mix.videos.select { |video| video.id == continuation }[0]?)
     end
-    index ||= 0
 
     mix.videos = mix.videos[index..-1]
   rescue ex
@@ -4684,8 +4630,7 @@ get "/api/v1/mixes/:rdid" do |env|
   if format == "html"
     response = JSON.parse(response)
     playlist_html = template_mix(response)
-    next_video = response["videos"].as_a[1]?.try &.["videoId"]
-    next_video ||= ""
+    next_video = response["videos"].as_a.select { |video| !video["author"].as_s.empty? }[0]?.try &.["videoId"]
 
     response = {
       "playlistHtml" => playlist_html,
@@ -5174,7 +5119,6 @@ get "/api/manifest/dash/id/:id" do |env|
   # we can opt to only add a source to a representation if it has a unique height within that representation
   unique_res = env.params.query["unique_res"]? && (env.params.query["unique_res"] == "true" || env.params.query["unique_res"] == "1")
 
-  client = make_client(YT_URL)
   begin
     video = get_video(id, PG_DB, region: region)
   rescue ex : VideoRedirect
@@ -5185,7 +5129,7 @@ get "/api/manifest/dash/id/:id" do |env|
   end
 
   if dashmpd = video.player_response["streamingData"]?.try &.["dashManifestUrl"]?.try &.as_s
-    manifest = client.get(dashmpd).body
+    manifest = YT_POOL.client &.get(dashmpd).body
 
     manifest = manifest.gsub(/<BaseURL>[^<]+<\/BaseURL>/) do |baseurl|
       url = baseurl.lchop("<BaseURL>")
@@ -5285,8 +5229,7 @@ get "/api/manifest/dash/id/:id" do |env|
 end
 
 get "/api/manifest/hls_variant/*" do |env|
-  client = make_client(YT_URL)
-  manifest = client.get(env.request.path)
+  manifest = YT_POOL.client &.get(env.request.path)
 
   if manifest.status_code != 200
     env.response.status_code = manifest.status_code
@@ -5311,8 +5254,7 @@ get "/api/manifest/hls_variant/*" do |env|
 end
 
 get "/api/manifest/hls_playlist/*" do |env|
-  client = make_client(YT_URL)
-  manifest = client.get(env.request.path)
+  manifest = YT_POOL.client &.get(env.request.path)
 
   if manifest.status_code != 200
     env.response.status_code = manifest.status_code
@@ -5515,7 +5457,7 @@ get "/videoplayback" do |env|
 
   client = make_client(URI.parse(host), region)
 
-  response = HTTP::Client::Response.new(403)
+  response = HTTP::Client::Response.new(500)
   5.times do
     begin
       response = client.head(url, headers)
@@ -5675,10 +5617,6 @@ get "/videoplayback" do |env|
   end
 end
 
-# We need this so the below route works as expected
-get "/ggpht*" do |env|
-end
-
 get "/ggpht/*" do |env|
   host = "https://yt3.ggpht.com"
   client = make_client(URI.parse(host))
@@ -5800,23 +5738,7 @@ get "/s_p/:id/:name" do |env|
   end
 end
 
-get "/vi/:id/:name" do |env|
-  id = env.params.url["id"]
-  name = env.params.url["name"]
-
-  host = "https://i.ytimg.com"
-  client = make_client(URI.parse(host))
-
-  if name == "maxres.jpg"
-    build_thumbnails(id, config, Kemal.config).each do |thumb|
-      if client.head("/vi/#{id}/#{thumb[:url]}.jpg").status_code == 200
-        name = thumb[:url] + ".jpg"
-        break
-      end
-    end
-  end
-  url = "/vi/#{id}/#{name}"
-
+get "/yts/img/:name" do |env|
   headers = HTTP::Headers.new
   REQUEST_HEADERS_WHITELIST.each do |header|
     if env.request.headers[header]?
@@ -5825,7 +5747,7 @@ get "/vi/:id/:name" do |env|
   end
 
   begin
-    client.get(url, headers) do |response|
+    YT_POOL.client &.get(env.request.resource, headers) do |response|
       env.response.status_code = response.status_code
       response.headers.each do |key, value|
         if !RESPONSE_HEADERS_BLACKLIST.includes? key
@@ -5846,11 +5768,59 @@ get "/vi/:id/:name" do |env|
   end
 end
 
+get "/vi/:id/:name" do |env|
+  id = env.params.url["id"]
+  name = env.params.url["name"]
+
+  if name == "maxres.jpg"
+    build_thumbnails(id, config, Kemal.config).each do |thumb|
+      if YT_IMG_POOL.client &.head("/vi/#{id}/#{thumb[:url]}.jpg").status_code == 200
+        name = thumb[:url] + ".jpg"
+        break
+      end
+    end
+  end
+  url = "/vi/#{id}/#{name}"
+
+  headers = HTTP::Headers.new
+  REQUEST_HEADERS_WHITELIST.each do |header|
+    if env.request.headers[header]?
+      headers[header] = env.request.headers[header]
+    end
+  end
+
+  begin
+    YT_IMG_POOL.client &.get(url, headers) do |response|
+      env.response.status_code = response.status_code
+      response.headers.each do |key, value|
+        if !RESPONSE_HEADERS_BLACKLIST.includes? key
+          env.response.headers[key] = value
+        end
+      end
+
+      env.response.headers["Access-Control-Allow-Origin"] = "*"
+
+      if response.status_code >= 300 && response.status_code != 404
+        env.response.headers.delete("Transfer-Encoding")
+        break
+      end
+
+      proxy_file(response, env)
+    end
+  rescue ex
+  end
+end
+
+get "/Captcha" do |env|
+  client = make_client(LOGIN_URL)
+  response = client.get(env.request.resource)
+  env.response.headers["Content-Type"] = response.headers["Content-Type"]
+  response.body
+end
+
 # Undocumented, creates anonymous playlist with specified 'video_ids', max 50 videos
 get "/watch_videos" do |env|
-  client = make_client(YT_URL)
-
-  response = client.get("#{env.request.path}?#{env.request.query}")
+  response = YT_POOL.client &.get(env.request.resource)
   if url = response.headers["Location"]?
     url = URI.parse(url).full_path
     next env.redirect url
@@ -5864,11 +5834,10 @@ error 404 do |env|
     item = md["id"]
 
     # Check if item is branding URL e.g. https://youtube.com/gaming
-    client = make_client(YT_URL)
-    response = client.get("/#{item}")
+    response = YT_POOL.client &.get("/#{item}")
 
     if response.status_code == 301
-      response = client.get(response.headers["Location"])
+      response = YT_POOL.client &.get(response.headers["Location"])
     end
 
     if response.body.empty?
@@ -5896,8 +5865,7 @@ error 404 do |env|
     end
 
     # Check if item is video ID
-    client = make_client(YT_URL)
-    if item.match(/^[a-zA-Z0-9_-]{11}$/) && client.head("/watch?v=#{item}").status_code != 404
+    if item.match(/^[a-zA-Z0-9_-]{11}$/) && YT_POOL.client &.head("/watch?v=#{item}").status_code != 404
       env.response.headers["Location"] = url
       halt env, status_code: 302
     end
@@ -5910,12 +5878,9 @@ end
 error 500 do |env|
   error_message = <<-END_HTML
   Looks like you've found a bug in Invidious. Feel free to open a new issue
-  <a href="https://github.com/omarroth/invidious/issues">
-    here
-  </a>
+  <a href="https://github.com/omarroth/invidious/issues">here</a>
   or send an email to
-  <a href="mailto:omarroth@protonmail.com">
-    omarroth@protonmail.com</a>.
+  <a href="mailto:#{CONFIG.admin_email}">#{CONFIG.admin_email}</a>.
   END_HTML
   templated "error"
 end
