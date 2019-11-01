@@ -30,3 +30,5 @@ default_user_preferences:
   related_videos: false
   # completely disable (hate) comments (can't be re-enabled by users atm):
   comments: ["",""]
+  default_home: ""
+  feed_menu: []
